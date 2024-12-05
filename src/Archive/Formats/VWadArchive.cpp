@@ -1,0 +1,753 @@
+
+// -----------------------------------------------------------------------------
+// SLADE - It's a Doom Editor
+// Copyright(C) 2008 - 2022 Simon Judd
+//
+// Email:       sirjuddington@gmail.com
+// Web:         http://slade.mancubus.net
+// Filename:    VWadArchive.cpp
+// Description: VWadArchive, archive class to handle vwad format archives
+//
+// This program is free software; you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the Free
+// Software Foundation; either version 2 of the License, or (at your option)
+// any later version.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA  02110 - 1301, USA.
+// -----------------------------------------------------------------------------
+
+
+// -----------------------------------------------------------------------------
+//
+// Includes
+//
+// -----------------------------------------------------------------------------
+#include "Main.h"
+#include "VWadArchive.h"
+#include "App.h"
+#include "General/Misc.h"
+#include "General/UI.h"
+#include "UI/WxUtils.h"
+#include "Utility/FileUtils.h"
+#include "Utility/StringUtils.h"
+#include "WadArchive.h"
+#include <fstream>
+#include <vwadprng.h>
+#include <vwadvfs.h>
+#include <vwadwrite.h>
+
+using namespace slade;
+
+
+// -----------------------------------------------------------------------------
+//
+// Variables
+//
+// -----------------------------------------------------------------------------
+CVAR(Bool, vwad_allow_duplicate_names, false, CVar::Save)
+
+
+// -----------------------------------------------------------------------------
+//
+// External Variables
+//
+// -----------------------------------------------------------------------------
+EXTERN_CVAR(Bool, archive_load_data)
+EXTERN_CVAR(Int, max_entry_size_mb)
+
+
+// -----------------------------------------------------------------------------
+//
+// VWadArchive Class Functions
+//
+// -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// VWadArchive class constructor
+// -----------------------------------------------------------------------------
+VWadArchive::VWadArchive() : Archive("vwad")
+{
+	if (vwad_allow_duplicate_names)
+		rootDir()->allowDuplicateNames(true);
+}
+
+// -----------------------------------------------------------------------------
+// VWadArchive class destructor
+// -----------------------------------------------------------------------------
+VWadArchive::~VWadArchive()
+{
+	if (fileutil::fileExists(temp_file_))
+		fileutil::removeFile(temp_file_);
+}
+
+static int vwad_ioseek(vwad_iostream *strm, int pos)
+{
+    assert(pos >= 0);
+    FILE *fl = (FILE *)strm->udata;
+    assert(fl != nullptr);
+    if (fseek(fl, pos, SEEK_SET) != 0)
+        return -1;
+    return 0;
+}
+
+static int vwad_ioread(vwad_iostream *strm, void *buf, int bufsize)
+{
+    assert(bufsize > 0);
+    FILE *fl = (FILE *)strm->udata;
+    assert(fl != nullptr);
+    if (fread(buf, bufsize, 1, fl) != 1)
+        return -1;
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Reads vwad data from a file
+// Returns true if successful, false otherwise
+// -----------------------------------------------------------------------------
+bool VWadArchive::open(string_view filename)
+{
+	// Check the file exists
+	if (!fileutil::fileExists(filename))
+	{
+		global::error = "File does not exist";
+		return false;
+	}
+
+	// Copy the vwad to a temp file (for use when saving)
+	generateTempFileName(filename);
+	fileutil::copyFile(filename, temp_file_);
+
+	// Open the file
+	FILE *in = fopen(wxutil::strFromView(filename).c_str(), "rb");
+	if (!in)
+	{
+		global::error = "Unable to open file";
+		return false;
+	}
+
+	// Create vwad stream
+	vwad_iostream *vwad_stream = (vwad_iostream *)calloc(1, sizeof(vwad_iostream));
+	vwad_stream->udata = in;
+	vwad_stream->seek = vwad_ioseek;
+	vwad_stream->read = vwad_ioread;
+
+	// Create vwad handle using stream
+	vwad_handle *vwad_hndl = vwad_open_archive(vwad_stream, VWAD_OPEN_DEFAULT, nullptr);
+
+	if (!vwad_hndl)
+	{
+		global::error = "Invalid vwad file";
+		return false;
+	}
+
+	// Stop announcements (don't want to be announcing modification due to entries being added etc)
+	const ArchiveModSignalBlocker sig_blocker{ *this };
+
+	// Go through all vwad entries
+	vwad_fidx entry_index = 0;
+	vwad_fidx total = vwad_get_archive_file_count(vwad_hndl);
+	std::string vwad_entry_filename; // used for libvwad path normalization
+	vwad_entry_filename.resize(256); // libvwad normalization max char limit
+	ui::setSplashProgressMessage("Reading vwad data");
+	for (; entry_index < total; entry_index++)
+	{
+		ui::setSplashProgress(-1.0f);
+
+		const char *entry_name = vwad_get_file_name(vwad_hndl, entry_index);
+
+		if (!entry_name)
+			continue;
+
+		memset(vwad_entry_filename.data(), 0, 256);
+
+		if (vwad_normalize_file_name(entry_name, vwad_entry_filename.data()) < 0)
+			continue;
+
+		// Since libvwad normalization retains the trailing slash for directories, check to see if
+		// the last character is a slash and if not consider it a file
+		if (vwad_entry_filename.back() != '/')
+		{
+			// Get the entry name as a Path (so we can break it up)
+			strutil::Path fn(vwad_entry_filename);
+
+			// Create entry
+			auto new_entry = std::make_shared<ArchiveEntry>(
+				misc::fileNameToLumpName(fn.fileName()), vwad_get_file_size(vwad_hndl, entry_index));
+
+			// Setup entry info
+			new_entry->setLoaded(false);
+			new_entry->exProp("VWadIndex") = entry_index;
+
+			// Add entry and directory to directory tree
+			auto ndir = createDir(fn.path(true));
+			ndir->addEntry(new_entry, true);
+
+			if (const auto ve_size = vwad_get_file_size(vwad_hndl, entry_index); ve_size < max_entry_size_mb * 1024 * 1024)
+			{
+				if (ve_size > 0)
+				{
+					vwad_fd vwad_entry_fd = vwad_open_fidx(vwad_hndl, entry_index);
+					if (vwad_entry_fd < 0)
+					{
+						global::error = fmt::format("Error getting vWad file descriptor for: {}", fn.fullPath());
+						return false;
+					}
+					vector<uint8_t> data(ve_size);
+					if (vwad_read(vwad_hndl, vwad_entry_fd, data.data(), ve_size) < 0)
+					{
+						global::error = fmt::format("Error importing vWad entry: {}", fn.fullPath());
+						vwad_fclose(vwad_hndl, vwad_entry_fd);
+						return false;
+					}
+					new_entry->importMem(data.data(), static_cast<uint32_t>(ve_size));
+					vwad_fclose(vwad_hndl, vwad_entry_fd);
+				}
+				new_entry->setLoaded(true);
+
+				// Determine its type
+				EntryType::detectEntryType(*new_entry);
+
+				// Unload data if needed
+				if (!archive_load_data)
+					new_entry->unloadData();
+			}
+			else
+			{
+				global::error = fmt::format("Entry too large: {} is {} mb", fn.fullPath(), ve_size / (1 << 20));
+				return false;
+			}
+		}
+		else
+		{
+			// VWad entry is a directory, add it to the directory tree
+			strutil::Path fn(vwad_entry_filename);
+			createDir(fn.path(true));
+		}
+	}
+	ui::updateSplash();
+
+	// Set all entries/directories to unmodified
+	vector<ArchiveEntry*> entry_list;
+	putEntryTreeAsList(entry_list);
+	for (auto& entry : entry_list)
+		entry->setState(ArchiveEntry::State::Unmodified);
+
+	// Enable announcements
+	sig_blocker.unblock();
+
+	// Setup variables
+	filename_      = filename;
+	file_modified_ = fileutil::fileModifiedTime(filename);
+	setModified(false);
+	on_disk_ = true;
+
+	ui::setSplashProgressMessage("");
+
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// Reads vwad format data from a MemChunk
+// Returns true if successful, false otherwise
+// -----------------------------------------------------------------------------
+bool VWadArchive::open(MemChunk& mc)
+{
+	// Write the MemChunk to a temp file
+	const auto tempfile = app::path("slade-temp-open.vwad", app::Dir::Temp);
+	mc.exportFile(tempfile);
+
+	// Load the file
+	const bool success = open(tempfile);
+
+	// Clean up
+	fileutil::removeFile(tempfile);
+
+	return success;
+}
+
+// -----------------------------------------------------------------------------
+// Writes the vwad archive to a MemChunk
+// Returns true if successful, false otherwise
+// -----------------------------------------------------------------------------
+bool VWadArchive::write(MemChunk& mc, bool update)
+{
+	bool success = false;
+
+	// Write to a temporary file
+	const auto tempfile = app::path("slade-temp-write.vwad", app::Dir::Temp);
+	if (write(tempfile, true))
+	{
+		// Load file into MemChunk
+		success = mc.importFile(tempfile);
+	}
+
+	// Clean up
+	wxRemoveFile(tempfile);
+
+	return success;
+}
+
+// -----------------------------------------------------------------------------
+// Writes the vwad archive to a file
+// Returns true if successful, false otherwise
+// -----------------------------------------------------------------------------
+bool VWadArchive::write(string_view filename, bool update)
+{
+	// Check for entries with duplicate names (not allowed for vwads)
+	auto all_dirs = rootDir()->allDirectories();
+	all_dirs.insert(all_dirs.begin(), rootDir());
+	for (const auto& dir : all_dirs)
+	{
+		if (auto* dup_entry = dir->findDuplicateEntryName())
+		{
+			global::error = fmt::format("Multiple entries named {} found in {}", dup_entry->name(), dup_entry->path());
+			return false;
+		}
+	}
+
+	// Open the file
+	FILE *out = fopen(wxutil::strFromView(filename).c_str(), "wb+");
+	if (!out)
+	{
+		global::error = "Unable to open file for saving. Make sure it isn't in use by another program.";
+		return false;
+	}
+
+	// Open as vwad for writing
+	vwadwr_iostream *vwad = vwadwr_new_file_stream(out);
+	if (!vwad)
+	{
+		global::error = "Unable to create vwad for saving";
+		fclose(out);
+		return false;
+	}
+
+	vwadwr_secret_key privkey;
+	vwadwr_public_key pubkey;
+
+	do {
+      prng_randombytes(privkey, sizeof(vwadwr_secret_key));
+    } while (!vwadwr_is_good_privkey(privkey));
+
+	int vwad_error = 0;
+
+	vwadwr_archive *vwad_archive = vwadwr_new_archive(NULL, vwad, "SLADE", NULL, NULL, 
+		VWADWR_NEW_DEFAULT, privkey, pubkey, &vwad_error);
+
+	if (!vwad_archive)
+	{
+		global::error = "Unable to create vwad for saving";
+		vwadwr_close_file_stream(vwad);
+		fclose(out);
+		return false;
+	}
+
+	// Get a linear list of all entries in the archive
+	vector<ArchiveEntry*> entries;
+	putEntryTreeAsList(entries);
+
+	// Go through all entries
+	auto n_entries = entries.size();
+	ui::setSplashProgressMessage("Writing vwad entries");
+	ui::setSplashProgress(0.0f);
+	ui::updateSplash();
+	for (size_t a = 0; a < n_entries; a++)
+	{
+		ui::setSplashProgress(static_cast<float>(a) / static_cast<float>(n_entries));
+
+		if (entries[a]->type() == EntryType::folderType())
+		{
+			if (update)
+				entries[a]->setState(ArchiveEntry::State::Unmodified);
+			continue;
+		}
+
+		// Get entry vwad index
+		vwadwr_fhandle vwad_hndl = vwadwr_create_file(vwad_archive, VWADWR_COMP_MEDIUM, (entries[a]->path() + entries[a]->name()).c_str(), NULL, 0);
+		if (vwad_hndl >= 0)
+		{
+			vwadwr_write(vwad_archive, vwad_hndl, entries[a]->rawData(), entries[a]->size());
+			vwadwr_close_file(vwad_archive, vwad_hndl);
+		}
+
+		// Update entry info
+		if (update)
+		{
+			entries[a]->setState(ArchiveEntry::State::Unmodified);
+			entries[a]->exProp("VWadIndex") = static_cast<int>(a);
+		}
+	}
+
+	// Clean up
+	vwadwr_finish_archive(&vwad_archive);
+	vwadwr_close_file_stream(vwad);
+
+	// Update the temp file
+	if (temp_file_.empty())
+		generateTempFileName(filename);
+	fileutil::copyFile(filename, temp_file_);
+
+	ui::setSplashProgressMessage("");
+
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// Loads an entry's data from the saved copy of the archive if any.
+// Returns false if the entry is invalid, doesn't belong to the archive or
+// doesn't exist in the saved copy, true otherwise.
+// -----------------------------------------------------------------------------
+bool VWadArchive::loadEntryData(ArchiveEntry* entry)
+{
+	return false;
+	
+	/*
+	// Check that the entry belongs to this archive
+	if (entry->parent() != this)
+	{
+		log::error("VWadArchive::loadEntryData: Entry {} attempting to load data from wrong parent!", entry->name());
+		return false;
+	}
+
+	// Do nothing if the entry's size is zero,
+	// or if it has already been loaded
+	if (entry->size() == 0 || entry->isLoaded())
+	{
+		entry->setLoaded();
+		return true;
+	}
+
+	// Check that the entry has a vwad index
+	int vwad_index;
+	if (entry->exProps().contains("VWadIndex"))
+		vwad_index = entry->exProp<int>("VWadIndex");
+	else
+	{
+		log::error("VWadArchive::loadEntryData: Entry {} has no vwad entry index!", entry->name());
+		return false;
+	}
+
+	// Open the file
+	wxFFileInputStream in(filename_);
+	if (!in.IsOk())
+	{
+		log::error("VWadArchive::loadEntryData: Unable to open vwad file \"{}\"!", filename_);
+		return false;
+	}
+
+	// Create vwad stream
+	wxZipInputStream vwad(in);
+	if (!vwad.IsOk())
+	{
+		log::error("VWadArchive::loadEntryData: Invalid vwad file \"{}\"!", filename_);
+		return false;
+	}
+
+	// Lock entry state
+	entry->lockState();
+
+	// Skip to correct entry in vwad
+	auto zentry = vwad.GetNextEntry();
+	for (long a = 0; a < vwad_index; a++)
+	{
+		delete zentry;
+		zentry = vwad.GetNextEntry();
+	}
+
+	// Abort if entry doesn't exist in vwad (some kind of error)
+	if (!zentry)
+	{
+		log::error("Error: VWadEntry for entry \"{}\" does not exist in vwad", entry->name());
+		return false;
+	}
+
+	// Read the data
+	vector<uint8_t> data(zentry->GetSize());
+	vwad.Read(data.data(), zentry->GetSize());
+	entry->importMem(data.data(), static_cast<uint32_t>(zentry->GetSize()));
+
+	// Set the entry to loaded
+	entry->setLoaded();
+	entry->unlockState();
+
+	// Clean up
+	delete zentry;
+
+	return true;
+	*/
+}
+
+// -----------------------------------------------------------------------------
+// Adds [entry] to the end of the namespace matching [add_namespace].
+// If [copy] is true a copy of the entry is added.
+// Returns the added entry or NULL if the entry is invalid
+//
+// In a vwad archive, a namespace is simply a first-level directory, ie
+// <root>/<namespace>
+// -----------------------------------------------------------------------------
+shared_ptr<ArchiveEntry> VWadArchive::addEntry(shared_ptr<ArchiveEntry> entry, string_view add_namespace)
+{
+	// Check namespace
+	if (add_namespace.empty() || add_namespace == "global")
+		return Archive::addEntry(entry, 0xFFFFFFFF, nullptr);
+
+	// Get/Create namespace dir
+	const auto dir = createDir(strutil::lower(add_namespace));
+
+	// Add the entry to the dir
+	return Archive::addEntry(entry, 0xFFFFFFFF, dir.get());
+}
+
+// -----------------------------------------------------------------------------
+// Returns the mapdesc_t information about the map at [entry], if [entry] is
+// actually a valid map (ie. a wad archive in the maps folder)
+// -----------------------------------------------------------------------------
+Archive::MapDesc VWadArchive::mapDesc(ArchiveEntry* maphead)
+{
+	MapDesc map;
+
+	// Check entry
+	if (!checkEntry(maphead))
+		return map;
+
+	// Check entry type
+	if (maphead->type()->formatId() != "archive_wad")
+		return map;
+
+	// Check entry directory
+	if (maphead->parentDir()->parent() != rootDir() || maphead->parentDir()->name() != "maps")
+		return map;
+
+	// Setup map info
+	map.archive = true;
+	map.head    = maphead->getShared();
+	map.end     = maphead->getShared();
+	map.name    = maphead->upperNameNoExt();
+
+	return map;
+}
+
+// -----------------------------------------------------------------------------
+// Detects all the maps in the archive and returns a vector of information about
+// them.
+// -----------------------------------------------------------------------------
+vector<Archive::MapDesc> VWadArchive::detectMaps()
+{
+	vector<MapDesc> ret;
+
+	// Get the maps directory
+	const auto mapdir = dirAtPath("maps");
+	if (!mapdir)
+		return ret;
+
+	// Go through entries in map dir
+	for (unsigned a = 0; a < mapdir->numEntries(); a++)
+	{
+		auto entry = mapdir->sharedEntryAt(a);
+
+		// Maps can only be wad archives
+		if (entry->type()->formatId() != "archive_wad")
+			continue;
+
+		// Detect map format (probably kinda slow but whatever, no better way to do it really)
+		auto       format = MapFormat::Unknown;
+		WadArchive tempwad;
+		tempwad.open(entry->data());
+		auto emaps = tempwad.detectMaps();
+		if (!emaps.empty())
+			format = emaps[0].format;
+
+		// Add map description
+		MapDesc md;
+		md.head    = entry;
+		md.end     = entry;
+		md.archive = true;
+		md.name    = entry->upperNameNoExt();
+		md.format  = format;
+		ret.push_back(md);
+	}
+
+	return ret;
+}
+
+// -----------------------------------------------------------------------------
+// Returns the first entry matching the search criteria in [options], or null if
+// no matching entry was found
+// -----------------------------------------------------------------------------
+ArchiveEntry* VWadArchive::findFirst(SearchOptions& options)
+{
+	// Init search variables
+	auto dir = rootDir().get();
+
+	// Check for search directory (overrides namespace)
+	if (options.dir)
+	{
+		dir = options.dir;
+	}
+	// Check for namespace
+	else if (!options.match_namespace.empty())
+	{
+		dir = dirAtPath(options.match_namespace);
+
+		// If the requested namespace doesn't exist, return nothing
+		if (!dir)
+			return nullptr;
+		else
+			options.search_subdirs = true; // Namespace search always includes namespace subdirs
+	}
+
+	// Do default search
+	auto opt            = options;
+	opt.dir             = dir;
+	opt.match_namespace = "";
+	return Archive::findFirst(opt);
+}
+
+// -----------------------------------------------------------------------------
+// Returns the last entry matching the search criteria in [options], or null if
+// no matching entry was found
+// -----------------------------------------------------------------------------
+ArchiveEntry* VWadArchive::findLast(SearchOptions& options)
+{
+	// Init search variables
+	auto dir = rootDir().get();
+
+	// Check for search directory (overrides namespace)
+	if (options.dir)
+	{
+		dir = options.dir;
+	}
+	// Check for namespace
+	else if (!options.match_namespace.empty())
+	{
+		dir = dirAtPath(options.match_namespace);
+
+		// If the requested namespace doesn't exist, return nothing
+		if (!dir)
+			return nullptr;
+		else
+			options.search_subdirs = true; // Namespace search always includes namespace subdirs
+	}
+
+	// Do default search
+	auto opt            = options;
+	opt.dir             = dir;
+	opt.match_namespace = "";
+	return Archive::findLast(opt);
+}
+
+// -----------------------------------------------------------------------------
+// Returns all entries matching the search criteria in [options]
+// -----------------------------------------------------------------------------
+vector<ArchiveEntry*> VWadArchive::findAll(SearchOptions& options)
+{
+	// Init search variables
+	auto                  dir = rootDir().get();
+	vector<ArchiveEntry*> ret;
+
+	// Check for search directory (overrides namespace)
+	if (options.dir)
+	{
+		dir = options.dir;
+	}
+	// Check for namespace
+	else if (!options.match_namespace.empty())
+	{
+		dir = dirAtPath(options.match_namespace);
+
+		// If the requested namespace doesn't exist, return nothing
+		if (!dir)
+			return ret;
+		else
+			options.search_subdirs = true; // Namespace search always includes namespace subdirs
+	}
+
+	// Do default search
+	auto opt            = options;
+	opt.dir             = dir;
+	opt.match_namespace = "";
+	return Archive::findAll(opt);
+}
+
+// -----------------------------------------------------------------------------
+// Generates the temp file path to use, from [filename].
+// The temp file will be in the configured temp folder
+// -----------------------------------------------------------------------------
+void VWadArchive::generateTempFileName(string_view filename)
+{
+	const strutil::Path tfn(filename);
+	temp_file_ = app::path(tfn.fileName(), app::Dir::Temp);
+	if (wxFileExists(temp_file_))
+	{
+		// Make sure we don't overwrite an existing temp file
+		// (in case there are multiple vwads open with the same name)
+		int n = 1;
+		while (true)
+		{
+			temp_file_ = app::path(fmt::format("{}.{}", tfn.fileName(), n), app::Dir::Temp);
+			if (!wxFileExists(temp_file_))
+				break;
+
+			n++;
+		}
+	}
+}
+
+
+// -----------------------------------------------------------------------------
+//
+// VWadArchive Class Static Functions
+//
+// -----------------------------------------------------------------------------
+
+
+// -----------------------------------------------------------------------------
+// Checks if the given data is a valid vwad archive
+// -----------------------------------------------------------------------------
+bool VWadArchive::isVWadArchive(MemChunk& mc)
+{
+	// Check size
+	if (mc.size() < 22)
+		return false;
+
+	// Read first 4 bytes
+	uint32_t sig;
+	mc.seek(0, SEEK_SET);
+	mc.read(&sig, sizeof(uint32_t));
+
+	// Check for signature
+	if (sig == 0x44415756) // File header
+		return true;
+
+	return false;
+}
+
+// -----------------------------------------------------------------------------
+// Checks if the file at [filename] is a valid vwad archive
+// -----------------------------------------------------------------------------
+bool VWadArchive::isVWadArchive(const string& filename)
+{
+	// Open the file for reading
+	wxFile file(filename);
+
+	// Check it opened
+	if (!file.IsOpened())
+		return false;
+
+	// Read first 4 bytes
+	uint32_t sig;
+	file.Read(&sig, sizeof(uint32_t));
+
+	// Check for signature
+	if (sig == 0x44415756) // File header
+		return true;
+
+	return false;
+}

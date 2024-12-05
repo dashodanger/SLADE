@@ -1226,6 +1226,9 @@
     <ClInclude Include="..\src\Archive\Formats\TarArchive.h">
       <Filter>Archive\Formats</Filter>
     </ClInclude>
+    <ClInclude Include="..\src\Archive\Formats\VWadArchive.h">
+      <Filter>Archive\Formats</Filter>
+    </ClInclude>
     <ClInclude Include="..\src\Archive\Formats\Wad2Archive.h">
       <Filter>Archive\Formats</Filter>
     </ClInclude>
