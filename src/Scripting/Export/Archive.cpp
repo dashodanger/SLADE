@@ -216,6 +216,7 @@ void registerArchive(sol::state& lua)
 #define REGISTER_ARCHIVE(type) lua.new_usertype<type>(#type, sol::base_classes, sol::bases<Archive>())
 	REGISTER_ARCHIVE(WadArchive);
 	REGISTER_ARCHIVE(ZipArchive);
+	REGISTER_ARCHIVE(VWadArchive);
 	REGISTER_ARCHIVE(LibArchive);
 	REGISTER_ARCHIVE(DatArchive);
 	REGISTER_ARCHIVE(ResArchive);

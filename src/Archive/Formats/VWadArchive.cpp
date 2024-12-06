@@ -52,6 +52,8 @@ using namespace slade;
 //
 // -----------------------------------------------------------------------------
 CVAR(Bool, vwad_allow_duplicate_names, false, CVar::Save)
+CVAR(String, vwad_private_key, "", CVar::Flag::Save)
+CVAR(String, vwad_author_name, "SLADE", CVar::Flag::Save)
 
 
 // -----------------------------------------------------------------------------
@@ -91,7 +93,7 @@ static int vwad_ioseek(vwad_iostream *strm, int pos)
 {
     assert(pos >= 0);
     FILE *fl = (FILE *)strm->udata;
-    assert(fl != nullptr);
+    assert(fl != NULL);
     if (fseek(fl, pos, SEEK_SET) != 0)
         return -1;
     return 0;
@@ -101,7 +103,7 @@ static int vwad_ioread(vwad_iostream *strm, void *buf, int bufsize)
 {
     assert(bufsize > 0);
     FILE *fl = (FILE *)strm->udata;
-    assert(fl != nullptr);
+    assert(fl != NULL);
     if (fread(buf, bufsize, 1, fl) != 1)
         return -1;
     return 0;
@@ -139,7 +141,7 @@ bool VWadArchive::open(string_view filename)
 	vwad_stream->read = vwad_ioread;
 
 	// Create vwad handle using stream
-	vwad_handle *vwad_hndl = vwad_open_archive(vwad_stream, VWAD_OPEN_DEFAULT, nullptr);
+	vwad_handle *vwad_hndl = vwad_open_archive(vwad_stream, VWAD_OPEN_DEFAULT, NULL);
 
 	if (!vwad_hndl)
 	{
@@ -332,14 +334,33 @@ bool VWadArchive::write(string_view filename, bool update)
 	vwadwr_secret_key privkey;
 	vwadwr_public_key pubkey;
 
-	do {
-      prng_randombytes(privkey, sizeof(vwadwr_secret_key));
-    } while (!vwadwr_is_good_privkey(privkey));
+	if (!vwad_private_key.empty())
+	{
+		if (vwadwr_z85_decode_key(vwad_private_key.value.c_str(), privkey) < 0)
+		{
+			global::error = "Unable to decode vwad_private_key (bad key?)";
+			vwadwr_close_file_stream(vwad);
+			return false;
+		}
+		if (!vwadwr_is_good_privkey(privkey))
+		{
+			global::error = "vwad_private_key is not sufficiently strong, generate a new one";
+			vwadwr_close_file_stream(vwad);
+			return false;
+		}
+	}
+	else //randomly generate signing key
+	{
+		do 
+		{
+			prng_randombytes(privkey, sizeof(vwadwr_secret_key));
+		} while (!vwadwr_is_good_privkey(privkey));
+	}
 
 	int vwad_error = 0;
 
-	vwadwr_archive *vwad_archive = vwadwr_new_archive(NULL, vwad, "SLADE", NULL, NULL, 
-		VWADWR_NEW_DEFAULT, privkey, pubkey, &vwad_error);
+	vwadwr_archive *vwad_archive = vwadwr_new_archive(NULL, vwad, vwad_author_name.empty() ? NULL : vwad_author_name.value.c_str(), 
+		NULL, NULL, VWADWR_NEW_DEFAULT, privkey, pubkey, &vwad_error);
 
 	if (!vwad_archive)
 	{
@@ -369,7 +390,7 @@ bool VWadArchive::write(string_view filename, bool update)
 			continue;
 		}
 
-		// Get entry vwad index
+		// Write entry
 		vwadwr_fhandle vwad_hndl = vwadwr_create_file(vwad_archive, VWADWR_COMP_MEDIUM, (entries[a]->path() + entries[a]->name()).c_str(), NULL, 0);
 		if (vwad_hndl >= 0)
 		{
@@ -406,9 +427,6 @@ bool VWadArchive::write(string_view filename, bool update)
 // -----------------------------------------------------------------------------
 bool VWadArchive::loadEntryData(ArchiveEntry* entry)
 {
-	return false;
-	
-	/*
 	// Check that the entry belongs to this archive
 	if (entry->parent() != this)
 	{
@@ -435,16 +453,23 @@ bool VWadArchive::loadEntryData(ArchiveEntry* entry)
 	}
 
 	// Open the file
-	wxFFileInputStream in(filename_);
-	if (!in.IsOk())
+	FILE *in = fopen(filename_.c_str(), "rb");
+	if (!in)
 	{
 		log::error("VWadArchive::loadEntryData: Unable to open vwad file \"{}\"!", filename_);
 		return false;
 	}
 
 	// Create vwad stream
-	wxZipInputStream vwad(in);
-	if (!vwad.IsOk())
+	vwad_iostream *vwad_stream = (vwad_iostream *)calloc(1, sizeof(vwad_iostream));
+	vwad_stream->udata = in;
+	vwad_stream->seek = vwad_ioseek;
+	vwad_stream->read = vwad_ioread;
+
+	// Create vwad handle using stream
+	vwad_handle *vwad_hndl = vwad_open_archive(vwad_stream, VWAD_OPEN_DEFAULT, NULL);
+
+	if (!vwad_hndl)
 	{
 		log::error("VWadArchive::loadEntryData: Invalid vwad file \"{}\"!", filename_);
 		return false;
@@ -453,35 +478,35 @@ bool VWadArchive::loadEntryData(ArchiveEntry* entry)
 	// Lock entry state
 	entry->lockState();
 
-	// Skip to correct entry in vwad
-	auto zentry = vwad.GetNextEntry();
-	for (long a = 0; a < vwad_index; a++)
-	{
-		delete zentry;
-		zentry = vwad.GetNextEntry();
-	}
-
 	// Abort if entry doesn't exist in vwad (some kind of error)
-	if (!zentry)
+	vwad_fd ventry = vwad_open_fidx(vwad_hndl, vwad_index);
+	if (ventry < 0)
 	{
 		log::error("Error: VWadEntry for entry \"{}\" does not exist in vwad", entry->name());
 		return false;
 	}
 
 	// Read the data
-	vector<uint8_t> data(zentry->GetSize());
-	vwad.Read(data.data(), zentry->GetSize());
-	entry->importMem(data.data(), static_cast<uint32_t>(zentry->GetSize()));
+	int ventry_size = vwad_get_file_size(vwad_hndl, vwad_index);
+	vector<uint8_t> data(ventry_size);
+	if (vwad_read(vwad_hndl, ventry, data.data(), ventry_size) < 0)
+	{
+		log::error("Error: VWadEntry for entry \"{}\" encountered a read error", entry->name());
+		vwad_fclose(vwad_hndl, vwad_index);
+		vwad_close_archive(&vwad_hndl);
+		return false;
+	}
+	entry->importMem(data.data(), static_cast<uint32_t>(ventry_size));
 
 	// Set the entry to loaded
 	entry->setLoaded();
 	entry->unlockState();
 
 	// Clean up
-	delete zentry;
+	vwad_fclose(vwad_hndl, vwad_index);
+	vwad_close_archive(&vwad_hndl);
 
 	return true;
-	*/
 }
 
 // -----------------------------------------------------------------------------
