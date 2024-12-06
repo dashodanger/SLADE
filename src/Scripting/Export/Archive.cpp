@@ -390,6 +390,9 @@ void registerArchivesNamespace(sol::state& lua)
 	archives["AddBookmark"]    = [](ArchiveEntry* entry) { app::archiveManager().addBookmark(entry->getShared()); };
 	archives["RemoveBookmark"] = [](ArchiveEntry* entry) { app::archiveManager().deleteBookmark(entry); };
 	archives["EntryType"]      = &EntryType::fromId;
+
+	auto vwad = archives.create_named("VWad");
+	vwad["GenerateKey"] = []() { return vwad::generatePrivateKey(); };
 }
 
 // -----------------------------------------------------------------------------

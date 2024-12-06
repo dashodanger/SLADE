@@ -19,7 +19,7 @@ public:
 	bool write(string_view filename, bool update = true) override; // Write to File
 
 	// Misc
-	bool loadEntryData(ArchiveEntry* entry) override;
+	bool   loadEntryData(ArchiveEntry* entry) override;
 
 	// Entry addition/removal
 	shared_ptr<ArchiveEntry> addEntry(shared_ptr<ArchiveEntry> entry, string_view add_namespace) override;
@@ -42,4 +42,9 @@ private:
 
 	void generateTempFileName(string_view filename);
 };
+
+namespace vwad
+{
+	string generatePrivateKey(void);
+}
 } // namespace slade

@@ -38,7 +38,6 @@
 #include "Utility/FileUtils.h"
 #include "Utility/StringUtils.h"
 #include "WadArchive.h"
-#include <fstream>
 #include <vwadprng.h>
 #include <vwadvfs.h>
 #include <vwadwrite.h>
@@ -53,7 +52,7 @@ using namespace slade;
 // -----------------------------------------------------------------------------
 CVAR(Bool, vwad_allow_duplicate_names, false, CVar::Save)
 CVAR(String, vwad_private_key, "", CVar::Flag::Save)
-CVAR(String, vwad_author_name, "SLADE", CVar::Flag::Save)
+CVAR(String, vwad_author_name, "", CVar::Flag::Save)
 
 
 // -----------------------------------------------------------------------------
@@ -314,6 +313,44 @@ bool VWadArchive::write(string_view filename, bool update)
 		}
 	}
 
+	// Open old vwad for copying, from the temp file that was copied on opening.
+	// This is used to copy any entries that have been previously saved/compressed
+	// and are unmodified, to greatly speed up vwad file saving by not having to
+	// recompress unchanged entries
+	FILE *invwad = NULL;
+	vwad_iostream *invwad_stream = NULL;
+	vwad_handle *invwad_handle = NULL;
+	std::string invwad_author;
+	std::string invwad_title;
+	std::string invwad_description;
+	if (fileutil::fileExists(temp_file_))
+	{
+		invwad = fopen(temp_file_.c_str(), "rb");
+		if (invwad)
+		{
+			invwad_stream = (vwad_iostream *)calloc(1, sizeof(vwad_iostream));
+			invwad_stream->udata = invwad;
+			invwad_stream->seek = vwad_ioseek;
+			invwad_stream->read = vwad_ioread;
+			invwad_handle = vwad_open_archive(invwad_stream, VWAD_OPEN_DEFAULT, NULL);
+			if (!invwad_handle)
+			{
+				free(invwad_stream);
+				invwad_stream = NULL;
+				fclose(invwad);
+				invwad = NULL;
+			}
+			invwad_author = vwad_get_archive_author(invwad_handle);
+			invwad_title = vwad_get_archive_title(invwad_handle);
+			vwad_uint comment_size = vwad_get_archive_comment_size(invwad_handle);
+			if (comment_size > 0)
+			{
+				invwad_description.resize(comment_size + 1);
+				vwad_get_archive_comment(invwad_handle, invwad_description.data(), comment_size + 1);
+			}
+		}
+	}
+
 	// Open the file
 	FILE *out = fopen(wxutil::strFromView(filename).c_str(), "wb+");
 	if (!out)
@@ -333,6 +370,7 @@ bool VWadArchive::write(string_view filename, bool update)
 
 	vwadwr_secret_key privkey;
 	vwadwr_public_key pubkey;
+	vwadwr_uint archive_flag;
 
 	if (!vwad_private_key.empty())
 	{
@@ -348,6 +386,7 @@ bool VWadArchive::write(string_view filename, bool update)
 			vwadwr_close_file_stream(vwad);
 			return false;
 		}
+		archive_flag = VWADWR_NEW_DEFAULT;
 	}
 	else //randomly generate signing key
 	{
@@ -355,12 +394,17 @@ bool VWadArchive::write(string_view filename, bool update)
 		{
 			prng_randombytes(privkey, sizeof(vwadwr_secret_key));
 		} while (!vwadwr_is_good_privkey(privkey));
+		archive_flag = VWADWR_NEW_DONT_SIGN;
 	}
 
 	int vwad_error = 0;
 
-	vwadwr_archive *vwad_archive = vwadwr_new_archive(NULL, vwad, vwad_author_name.empty() ? NULL : vwad_author_name.value.c_str(), 
-		NULL, NULL, VWADWR_NEW_DEFAULT, privkey, pubkey, &vwad_error);
+	if (!vwad_author_name.empty())
+		invwad_author = vwad_author_name;
+
+	vwadwr_archive *vwad_archive = vwadwr_new_archive(NULL, vwad, invwad_author.empty() ? NULL : invwad_author.c_str(), 
+		invwad_title.empty() ? NULL : invwad_title.c_str(), invwad_description.empty() ? NULL : invwad_description.c_str(), 
+		archive_flag, privkey, pubkey, &vwad_error);
 
 	if (!vwad_archive)
 	{
@@ -368,33 +412,6 @@ bool VWadArchive::write(string_view filename, bool update)
 		vwadwr_close_file_stream(vwad);
 		fclose(out);
 		return false;
-	}
-
-	// Open old vwad for copying, from the temp file that was copied on opening.
-	// This is used to copy any entries that have been previously saved/compressed
-	// and are unmodified, to greatly speed up vwad file saving by not having to
-	// recompress unchanged entries
-	FILE *invwad = NULL;
-	vwad_iostream *invwad_stream = NULL;
-	vwad_handle *invwad_handle = NULL;
-	if (fileutil::fileExists(temp_file_))
-	{
-		invwad = fopen(temp_file_.c_str(), "rb");
-		if (invwad)
-		{
-			invwad_stream = (vwad_iostream *)calloc(1, sizeof(vwad_iostream));
-			invwad_stream->udata = invwad;
-			invwad_stream->seek = vwad_ioseek;
-			invwad_stream->read = vwad_ioread;
-			invwad_handle = vwad_open_archive(invwad_stream, VWAD_OPEN_DEFAULT, NULL);
-			if (!invwad_handle)
-			{
-				free(invwad_stream);
-				invwad_stream = NULL;
-				fclose(invwad);
-				invwad = NULL;
-			}
-		}
 	}
 
 	// Get a linear list of all entries in the archive
@@ -909,4 +926,20 @@ bool VWadArchive::isVWadArchive(const string& filename)
 		return true;
 
 	return false;
+}
+
+// -----------------------------------------------------------------------------
+// Generates an ASCII-encoded private key for vWAD signing
+// -----------------------------------------------------------------------------
+std::string vwad::generatePrivateKey(void)
+{
+	vwadwr_secret_key privkey;
+	do 
+	{
+		prng_randombytes(privkey, sizeof(vwadwr_secret_key));
+	} while (!vwadwr_is_good_privkey(privkey));
+	vwadwr_z85_key z85_key;
+	vwadwr_z85_encode_key(privkey, z85_key);
+	std::string encoded_key(z85_key);
+	return encoded_key;
 }
