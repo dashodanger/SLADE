@@ -33,18 +33,31 @@ public:
 	ArchiveEntry*         findLast(SearchOptions& options) override;
 	vector<ArchiveEntry*> findAll(SearchOptions& options) override;
 
+	// Metadata
+	string getAuthor();
+	string getTitle();
+	string getComment();
+	bool   isSigned();
+	string getPublicKey();
+
 	// Static functions
 	static bool isVWadArchive(MemChunk& mc);
 	static bool isVWadArchive(const string& filename);
 
 private:
 	string temp_file_;
+	string author_;
+	string title_;
+	string comment_;
+	bool   signed_;
+	string pubkey_;
 
 	void generateTempFileName(string_view filename);
 };
 
 namespace vwad
 {
-	string generatePrivateKey(void);
+	string generatePrivateKey();
+	string derivePublicKey(string_view privkey);
 }
 } // namespace slade

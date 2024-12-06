@@ -151,10 +151,29 @@ bool VWadArchive::open(string_view filename)
 	// Stop announcements (don't want to be announcing modification due to entries being added etc)
 	const ArchiveModSignalBlocker sig_blocker{ *this };
 
+	// Check vwad properties (if applicable)
+	author_ = vwad_get_archive_author(vwad_hndl);
+	title_  = vwad_get_archive_title(vwad_hndl);
+	int comment_size = vwad_get_archive_comment_size(vwad_hndl);
+	if (comment_size > 0)
+	{
+		comment_.resize(comment_size + 1);
+		vwad_get_archive_comment(vwad_hndl, comment_.data(), comment_size + 1);
+	}
+	signed_ = (vwad_is_authenticated(vwad_hndl) && vwad_has_pubkey(vwad_hndl));
+	if (signed_)
+	{
+		vwad_public_key rawpubkey;
+		vwad_get_pubkey(vwad_hndl, rawpubkey);
+		vwad_z85_key z85_key;
+		vwad_z85_encode_key(rawpubkey, z85_key);
+		pubkey_ = std::string(z85_key);
+	}
+
 	// Go through all vwad entries
 	vwad_fidx entry_index = 0;
 	vwad_fidx total = vwad_get_archive_file_count(vwad_hndl);
-	std::string vwad_entry_filename; // used for libvwad path normalization
+	string vwad_entry_filename; // used for libvwad path normalization
 	vwad_entry_filename.resize(256); // libvwad normalization max char limit
 	ui::setSplashProgressMessage("Reading vwad data");
 	for (; entry_index < total; entry_index++)
@@ -320,9 +339,6 @@ bool VWadArchive::write(string_view filename, bool update)
 	FILE *invwad = NULL;
 	vwad_iostream *invwad_stream = NULL;
 	vwad_handle *invwad_handle = NULL;
-	std::string invwad_author;
-	std::string invwad_title;
-	std::string invwad_description;
 	if (fileutil::fileExists(temp_file_))
 	{
 		invwad = fopen(temp_file_.c_str(), "rb");
@@ -339,14 +355,6 @@ bool VWadArchive::write(string_view filename, bool update)
 				invwad_stream = NULL;
 				fclose(invwad);
 				invwad = NULL;
-			}
-			invwad_author = vwad_get_archive_author(invwad_handle);
-			invwad_title = vwad_get_archive_title(invwad_handle);
-			vwad_uint comment_size = vwad_get_archive_comment_size(invwad_handle);
-			if (comment_size > 0)
-			{
-				invwad_description.resize(comment_size + 1);
-				vwad_get_archive_comment(invwad_handle, invwad_description.data(), comment_size + 1);
 			}
 		}
 	}
@@ -399,11 +407,8 @@ bool VWadArchive::write(string_view filename, bool update)
 
 	int vwad_error = 0;
 
-	if (!vwad_author_name.empty())
-		invwad_author = vwad_author_name;
-
-	vwadwr_archive *vwad_archive = vwadwr_new_archive(NULL, vwad, invwad_author.empty() ? NULL : invwad_author.c_str(), 
-		invwad_title.empty() ? NULL : invwad_title.c_str(), invwad_description.empty() ? NULL : invwad_description.c_str(), 
+	vwadwr_archive *vwad_archive = vwadwr_new_archive(NULL, vwad, !vwad_author_name.empty() ? vwad_author_name.value.c_str() : 
+		(!author_.empty() ? author_.c_str() : NULL), !title_.empty() ? title_.c_str() : NULL, !comment_.empty() ? comment_.c_str() : NULL, 
 		archive_flag, privkey, pubkey, &vwad_error);
 
 	if (!vwad_archive)
@@ -876,6 +881,34 @@ void VWadArchive::generateTempFileName(string_view filename)
 	}
 }
 
+string VWadArchive::getAuthor()
+{
+	string ret = author_.empty() ? "" : author_;
+	return ret;
+}
+
+string VWadArchive::getTitle()
+{
+	string ret = title_.empty() ? "" : title_;
+	return ret;
+}
+
+string VWadArchive::getComment()
+{
+	string ret = comment_.empty() ? "" : comment_;
+	return ret;
+}
+
+bool   VWadArchive::isSigned()
+{
+	return signed_;
+}
+
+string VWadArchive::getPublicKey()
+{
+	string ret = pubkey_.empty() ? "" : pubkey_;
+	return ret;
+}
 
 // -----------------------------------------------------------------------------
 //
@@ -931,7 +964,7 @@ bool VWadArchive::isVWadArchive(const string& filename)
 // -----------------------------------------------------------------------------
 // Generates an ASCII-encoded private key for vWAD signing
 // -----------------------------------------------------------------------------
-std::string vwad::generatePrivateKey(void)
+string vwad::generatePrivateKey()
 {
 	vwadwr_secret_key privkey;
 	do 
@@ -940,6 +973,21 @@ std::string vwad::generatePrivateKey(void)
 	} while (!vwadwr_is_good_privkey(privkey));
 	vwadwr_z85_key z85_key;
 	vwadwr_z85_encode_key(privkey, z85_key);
-	std::string encoded_key(z85_key);
+	string encoded_key(z85_key);
+	return encoded_key;
+}
+
+// -----------------------------------------------------------------------------
+// Derives an ASCII-encoded public key from a provided ASCII-encoded private key
+// -----------------------------------------------------------------------------
+string vwad::derivePublicKey(string_view privkey)
+{
+	vwadwr_secret_key decoded_key;
+	vwadwr_z85_decode_key(wxutil::strFromView(privkey).c_str(), decoded_key);
+	vwadwr_public_key pubkey;
+	vwadwr_z85_get_pubkey(pubkey, decoded_key);
+	vwadwr_z85_key z85_key;
+	vwadwr_z85_encode_key(pubkey, z85_key);
+	string encoded_key(z85_key);
 	return encoded_key;
 }

@@ -820,6 +820,10 @@ static CC25519_INLINE void edsign_sec_to_pub (vwadwr_ubyte *pub, const vwadwr_ub
   sm_pack(pub, expanded);
 }
 
+void vwadwr_z85_get_pubkey (vwadwr_ubyte *pubkey, const vwadwr_ubyte *privkey) {
+  edsign_sec_to_pub (pubkey, privkey);
+}
+
 static int hash_with_prefix (vwadwr_ubyte *out_fp,
                              vwadwr_ubyte *init_block, vwadwr_uint prefix_size,
                              cc_ed25519_iostream *strm)

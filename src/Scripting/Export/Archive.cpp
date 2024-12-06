@@ -391,8 +391,15 @@ void registerArchivesNamespace(sol::state& lua)
 	archives["RemoveBookmark"] = [](ArchiveEntry* entry) { app::archiveManager().deleteBookmark(entry); };
 	archives["EntryType"]      = &EntryType::fromId;
 
+	// Create a VWad namespace within the Archives namespace
 	auto vwad = archives.create_named("VWad");
-	vwad["GenerateKey"] = []() { return vwad::generatePrivateKey(); };
+	vwad["CreatePrivateKey"] = []() { return vwad::generatePrivateKey(); };
+	vwad["DerivePublicKey"] = [](string_view privkey) { return vwad::derivePublicKey(privkey); };
+	vwad["GetAuthor"] = [](Archive& archive) { VWadArchive &vwad = (VWadArchive &)archive; return vwad.getAuthor(); };
+	vwad["GetTitle"] = [](Archive& archive) { VWadArchive &vwad = (VWadArchive &)archive; return vwad.getTitle(); };
+	vwad["GetComment"] = [](Archive& archive) { VWadArchive &vwad = (VWadArchive &)archive; return vwad.getComment(); };
+	vwad["GetPublicKey"] = [](Archive& archive) { VWadArchive &vwad = (VWadArchive &)archive; return vwad.getPublicKey(); };
+	vwad["IsSigned"] = [](Archive& archive) { VWadArchive &vwad = (VWadArchive &)archive; return vwad.isSigned(); };
 }
 
 // -----------------------------------------------------------------------------

@@ -176,6 +176,7 @@ extern void (*vwadwr_assertion_failed) (const char *fmt, ...);
 // encoded key contains a checksum, so mistyped keys could be detected.
 void vwadwr_z85_encode_key (const vwadwr_public_key inkey, vwadwr_z85_key enkey);
 vwadwr_result vwadwr_z85_decode_key (const vwadwr_z85_key enkey, vwadwr_public_key outkey);
+void vwadwr_z85_get_pubkey (vwadwr_ubyte *pubkey, const vwadwr_ubyte *privkey);
 
 
 // ////////////////////////////////////////////////////////////////////////// //
