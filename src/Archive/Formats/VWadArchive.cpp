@@ -370,6 +370,33 @@ bool VWadArchive::write(string_view filename, bool update)
 		return false;
 	}
 
+	// Open old vwad for copying, from the temp file that was copied on opening.
+	// This is used to copy any entries that have been previously saved/compressed
+	// and are unmodified, to greatly speed up vwad file saving by not having to
+	// recompress unchanged entries
+	FILE *invwad = NULL;
+	vwad_iostream *invwad_stream = NULL;
+	vwad_handle *invwad_handle = NULL;
+	if (fileutil::fileExists(temp_file_))
+	{
+		invwad = fopen(temp_file_.c_str(), "rb");
+		if (invwad)
+		{
+			invwad_stream = (vwad_iostream *)calloc(1, sizeof(vwad_iostream));
+			invwad_stream->udata = invwad;
+			invwad_stream->seek = vwad_ioseek;
+			invwad_stream->read = vwad_ioread;
+			invwad_handle = vwad_open_archive(invwad_stream, VWAD_OPEN_DEFAULT, NULL);
+			if (!invwad_handle)
+			{
+				free(invwad_stream);
+				invwad_stream = NULL;
+				fclose(invwad);
+				invwad = NULL;
+			}
+		}
+	}
+
 	// Get a linear list of all entries in the archive
 	vector<ArchiveEntry*> entries;
 	putEntryTreeAsList(entries);
@@ -390,12 +417,117 @@ bool VWadArchive::write(string_view filename, bool update)
 			continue;
 		}
 
-		// Write entry
-		vwadwr_fhandle vwad_hndl = vwadwr_create_file(vwad_archive, VWADWR_COMP_MEDIUM, (entries[a]->path() + entries[a]->name()).c_str(), NULL, 0);
-		if (vwad_hndl >= 0)
+		// Get entry vwad index
+		int index = -1;
+		if (entries[a]->exProps().contains("VWadIndex"))
+			index = entries[a]->exProp<int>("VWadIndex");
+
+		auto saname = entries[a]->path() + entries[a]->name();
+
+		if (!invwad || entries[a]->state() != ArchiveEntry::State::Unmodified || index < 0
+			|| index >= vwad_get_archive_file_count(invwad_handle))
 		{
-			vwadwr_write(vwad_archive, vwad_hndl, entries[a]->rawData(), entries[a]->size());
-			vwadwr_close_file(vwad_archive, vwad_hndl);
+			// If the current entry has been changed, or doesn't exist in the old vwad,
+			// (re)compress its data and write it to the vwad
+			vwadwr_fhandle vwad_hndl = vwadwr_create_file(vwad_archive, VWADWR_COMP_MEDIUM, saname.c_str(), 
+				NULL, std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+			if (vwad_hndl < 0)
+			{
+				global::error = fmt::format("Unable to write {} to vwad", saname);
+				if (invwad_handle)
+					vwad_close_archive(&invwad_handle);
+				vwadwr_free_archive(&vwad_archive);
+				vwadwr_close_file_stream(vwad);
+				return false;
+			}
+			else
+			{
+				vwadwr_write(vwad_archive, vwad_hndl, entries[a]->rawData(), entries[a]->size());
+				vwadwr_close_file(vwad_archive, vwad_hndl);
+			}
+		}
+		else
+		{
+			vwadwr_fhandle vwad_hndl = vwadwr_create_raw_file(vwad_archive,
+														vwad_get_file_name(invwad_handle, index),
+														vwad_get_file_group_name(invwad_handle, index),
+														vwad_get_fcrc32(invwad_handle, index),
+														vwad_get_ftime(invwad_handle, index));
+			if (vwad_hndl < 0) 
+			{
+				global::error = fmt::format("Unable to copy {} to vwad", saname);
+				vwad_close_archive(&invwad_handle);
+				vwadwr_free_archive(&vwad_archive);
+				vwadwr_close_file_stream(vwad);
+				return false;
+			}
+
+			const int entry_chunk_count = vwad_get_file_chunk_count(invwad_handle, index);
+			if (entry_chunk_count < 0) 
+			{
+				global::error = fmt::format("Unable to copy {} to vwad", saname);
+				vwad_close_archive(&invwad_handle);
+				vwadwr_close_file(vwad_archive, vwad_hndl);
+				vwadwr_free_archive(&vwad_archive);
+				vwadwr_close_file_stream(vwad);
+				return false;
+			}
+
+			if (entry_chunk_count > 0)
+			{
+				char *buf = (char *)malloc(VWAD_MAX_RAW_CHUNK_SIZE);
+				int pksz, upksz;
+				vwad_bool packed;
+				vwad_result res;
+
+				for (int chunk = 0; chunk < entry_chunk_count; chunk++)
+				{
+					memset(buf, 0, VWAD_MAX_RAW_CHUNK_SIZE);
+					res = vwad_get_raw_file_chunk_info(invwad_handle, index, chunk, &pksz, &upksz, &packed);
+					if (res != VWAD_OK) 
+					{
+						global::error = fmt::format("Unable to copy {} to vwad", saname);
+						vwad_close_archive(&invwad_handle);
+						vwadwr_close_file(vwad_archive, vwad_hndl);
+						vwadwr_free_archive(&vwad_archive);
+						vwadwr_close_file_stream(vwad);
+						free(buf);
+						return false;
+					}
+					res = vwad_read_raw_file_chunk(invwad_handle, index, chunk, buf);
+					if (res != VWAD_OK) 
+					{
+						global::error = fmt::format("Unable to copy {} to vwad", saname);
+						vwad_close_archive(&invwad_handle);
+						vwadwr_close_file(vwad_archive, vwad_hndl);
+						vwadwr_free_archive(&vwad_archive);
+						vwadwr_close_file_stream(vwad);
+						free(buf);
+						return false;
+					}
+					res = vwadwr_write_raw_chunk(vwad_archive, vwad_hndl, buf, pksz, upksz, packed);
+					if (res != VWADWR_OK) 
+					{
+						global::error = fmt::format("Unable to copy {} to vwad", saname);
+						vwad_close_archive(&invwad_handle);
+						vwadwr_close_file(vwad_archive, vwad_hndl);
+						vwadwr_free_archive(&vwad_archive);
+						vwadwr_close_file_stream(vwad);
+						free(buf);
+						return false;
+					}
+				}
+				free(buf);
+			}
+
+			if (vwadwr_close_file(vwad_archive, vwad_hndl) != VWADWR_OK) 
+			{
+				global::error = fmt::format("Unable to copy {} to vwad", saname);
+				vwad_close_archive(&invwad_handle);
+				vwadwr_free_archive(&vwad_archive);
+				vwadwr_close_file_stream(vwad);
+				return false;
+			}
 		}
 
 		// Update entry info
@@ -407,6 +539,8 @@ bool VWadArchive::write(string_view filename, bool update)
 	}
 
 	// Clean up
+	if (invwad_handle)
+		vwad_close_archive(&invwad_handle);
 	vwadwr_finish_archive(&vwad_archive);
 	vwadwr_close_file_stream(vwad);
 
