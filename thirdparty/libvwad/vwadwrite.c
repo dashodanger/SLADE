@@ -3039,11 +3039,11 @@ static vwadwr_result vwadwr_write_directory (vwadwr_archive *wad, vwadwr_iostrea
     #endif
     fdirofs += 4;
   }
-  vassert(fdirofs = 4+wad->chunkCount*VWADWR_CHUNK_ENTRY_SIZE +
+  vassert(fdirofs == 4+wad->chunkCount*VWADWR_CHUNK_ENTRY_SIZE +
                     4+wad->fileCount*VWADWR_FILE_ENTRY_SIZE);
   fdirofs += fatSize;
-  vassert(fdirofs = namesStart);
-  vassert(ccc = wad->chunkCount);
+  vassert(fdirofs == namesStart);
+  vassert(ccc == wad->chunkCount);
   // names
   fdirofs += nameOfs;
   vassert(fdirofs == dirsz);
