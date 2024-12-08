@@ -320,6 +320,13 @@ bool VWadArchive::write(MemChunk& mc, bool update)
 // -----------------------------------------------------------------------------
 bool VWadArchive::write(string_view filename, bool update)
 {
+	// If no entries at all, do not attempt to make a vWAD
+	if (numEntries() == 0)
+	{
+		global::error = "Cannot write empty vWADs!";
+		return false;
+	}
+
 	// Check for entries with duplicate names (not allowed for vwads)
 	auto all_dirs = rootDir()->allDirectories();
 	all_dirs.insert(all_dirs.begin(), rootDir());
@@ -432,10 +439,19 @@ bool VWadArchive::write(string_view filename, bool update)
 	{
 		ui::setSplashProgress(static_cast<float>(a) / static_cast<float>(n_entries));
 
+		// Can't write "just" a directory
 		if (entries[a]->type() == EntryType::folderType())
 		{
 			if (update)
 				entries[a]->setState(ArchiveEntry::State::Unmodified);
+			continue;
+		}
+		// Can't write nameless entires
+		if (entries[a]->name().empty())
+		{
+			if (update)
+				entries[a]->setState(ArchiveEntry::State::Unmodified);
+			log::error("Attempted to write vWAD entry with an empty name.");
 			continue;
 		}
 
@@ -458,7 +474,7 @@ bool VWadArchive::write(string_view filename, bool update)
 				global::error = fmt::format("Unable to write {} to vwad", saname);
 				if (invwad_handle)
 					vwad_close_archive(&invwad_handle);
-				vwadwr_free_archive(&vwad_archive);
+				vwadwr_finish_archive(&vwad_archive);
 				vwadwr_close_file_stream(vwad);
 				return false;
 			}
@@ -479,7 +495,7 @@ bool VWadArchive::write(string_view filename, bool update)
 			{
 				global::error = fmt::format("Unable to copy {} to vwad", saname);
 				vwad_close_archive(&invwad_handle);
-				vwadwr_free_archive(&vwad_archive);
+				vwadwr_finish_archive(&vwad_archive);
 				vwadwr_close_file_stream(vwad);
 				return false;
 			}
@@ -490,7 +506,7 @@ bool VWadArchive::write(string_view filename, bool update)
 				global::error = fmt::format("Unable to copy {} to vwad", saname);
 				vwad_close_archive(&invwad_handle);
 				vwadwr_close_file(vwad_archive, vwad_hndl);
-				vwadwr_free_archive(&vwad_archive);
+				vwadwr_finish_archive(&vwad_archive);
 				vwadwr_close_file_stream(vwad);
 				return false;
 			}
@@ -511,7 +527,7 @@ bool VWadArchive::write(string_view filename, bool update)
 						global::error = fmt::format("Unable to copy {} to vwad", saname);
 						vwad_close_archive(&invwad_handle);
 						vwadwr_close_file(vwad_archive, vwad_hndl);
-						vwadwr_free_archive(&vwad_archive);
+						vwadwr_finish_archive(&vwad_archive);
 						vwadwr_close_file_stream(vwad);
 						free(buf);
 						return false;
@@ -522,7 +538,7 @@ bool VWadArchive::write(string_view filename, bool update)
 						global::error = fmt::format("Unable to copy {} to vwad", saname);
 						vwad_close_archive(&invwad_handle);
 						vwadwr_close_file(vwad_archive, vwad_hndl);
-						vwadwr_free_archive(&vwad_archive);
+						vwadwr_finish_archive(&vwad_archive);
 						vwadwr_close_file_stream(vwad);
 						free(buf);
 						return false;
@@ -533,7 +549,7 @@ bool VWadArchive::write(string_view filename, bool update)
 						global::error = fmt::format("Unable to copy {} to vwad", saname);
 						vwad_close_archive(&invwad_handle);
 						vwadwr_close_file(vwad_archive, vwad_hndl);
-						vwadwr_free_archive(&vwad_archive);
+						vwadwr_finish_archive(&vwad_archive);
 						vwadwr_close_file_stream(vwad);
 						free(buf);
 						return false;
@@ -546,7 +562,7 @@ bool VWadArchive::write(string_view filename, bool update)
 			{
 				global::error = fmt::format("Unable to copy {} to vwad", saname);
 				vwad_close_archive(&invwad_handle);
-				vwadwr_free_archive(&vwad_archive);
+				vwadwr_finish_archive(&vwad_archive);
 				vwadwr_close_file_stream(vwad);
 				return false;
 			}
@@ -563,8 +579,13 @@ bool VWadArchive::write(string_view filename, bool update)
 	// Clean up
 	if (invwad_handle)
 		vwad_close_archive(&invwad_handle);
-	vwadwr_finish_archive(&vwad_archive);
-	vwadwr_close_file_stream(vwad);
+	if (vwadwr_finish_archive(&vwad_archive) < 0)
+	{
+		vwadwr_close_file_stream(vwad);
+		return false;
+	}
+	else
+		vwadwr_close_file_stream(vwad);
 
 	// Update the temp file
 	if (temp_file_.empty())
